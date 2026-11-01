@@ -29,15 +29,17 @@ export class SearchService {
       const cleanBaseUrl = searxngUrl.endsWith('/') ? searxngUrl.slice(0, -1) : searxngUrl;
       const searchUrl = cleanBaseUrl.includes('/search') ? cleanBaseUrl : `${cleanBaseUrl}/search`;
 
+      // Do not force a hard-coded engine list here. SearXNG may have a
+      // different enabled-engine configuration; forcing google,bing,duckduckgo
+      // can result in no usable engines and an empty results array.
       const response = await axios.get(searchUrl, {
         params: {
           q: query,
-          format: 'json',
-          engines: 'google,bing,duckduckgo'
+          format: 'json'
         },
         headers: { Accept: 'application/json' },
         responseType: 'json',
-        timeout: 15000
+        timeout: 20000
       });
 
       const rawResults = response.data?.results;
@@ -65,9 +67,6 @@ export class SearchService {
         const domain = urlObj.hostname.replace(/^www\./, '');
         let isSupported = false;
 
-        // Retailer classification must never decide whether a valid search
-        // result is discarded. A database/config lookup failure only means
-        // we cannot confirm support for that retailer.
         try {
           const config = await this.retailerQueryService.getRetailerForUrl(result.url);
           isSupported = !!config;
