@@ -29,36 +29,39 @@ jobs:
           TARGET_DATABASE_URL: ${{ secrets.TARGET_DATABASE_URL }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          docker run --rm -i \
             -e SOURCE_DATABASE_URL \
             -e TARGET_DATABASE_URL \
-            postgres:18-alpine sh -euc '
-              inspect_db() {
-                label="$1"
-                url="$2"
-                echo
-                echo "===== $label ====="
-                psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "SELECT current_database() AS database, version() AS server_version;"
-                psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "
-                  SELECT schemaname AS schema, relname AS table,
-                         n_live_tup AS estimated_rows
-                  FROM pg_stat_user_tables
-                  WHERE schemaname NOT IN ('''pg_catalog''', '''information_schema''')
-                  ORDER BY schemaname, relname;"
-                psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "
-                  SELECT extname AS extension, extversion AS version
-                  FROM pg_extension ORDER BY extname;"
-                psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "
-                  SELECT pg_size_pretty(pg_database_size(current_database())) AS database_size;"
-                if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "SELECT to_regclass('''public.migrations''') IS NOT NULL" | grep -qx t; then
-                  echo "Applied application migrations:"
-                  psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "SELECT name FROM public.migrations ORDER BY name;"
-                else
-                  echo "No public.migrations table found."
-                fi
-              }
-              inspect_db "RENDER SOURCE" "$SOURCE_DATABASE_URL"
-              inspect_db "PRISMA TARGET" "$TARGET_DATABASE_URL"
-              echo
-              echo "Inspection finished. This workflow only ran SELECT queries; it did not modify either database."
-            '
+            postgres:18-alpine sh -s <<'CONTAINER_SCRIPT'
+          set -eu
+
+          inspect_db() {
+            label="$1"
+            url="$2"
+            echo
+            echo "===== $label ====="
+            psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "SELECT current_database() AS database, version() AS server_version;"
+            psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "
+              SELECT schemaname AS schema, relname AS table,
+                     n_live_tup AS estimated_rows
+              FROM pg_stat_user_tables
+              WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+              ORDER BY schemaname, relname;"
+            psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "
+              SELECT extname AS extension, extversion AS version
+              FROM pg_extension ORDER BY extname;"
+            psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "
+              SELECT pg_size_pretty(pg_database_size(current_database())) AS database_size;"
+            if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "SELECT to_regclass('public.migrations') IS NOT NULL" | grep -qx t; then
+              echo "Applied application migrations:"
+              psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off -c "SELECT name FROM public.migrations ORDER BY name;"
+            else
+              echo "No public.migrations table found."
+            fi
+          }
+
+          inspect_db "RENDER SOURCE" "$SOURCE_DATABASE_URL"
+          inspect_db "PRISMA TARGET" "$TARGET_DATABASE_URL"
+          echo
+          echo "Inspection finished. This workflow only ran SELECT queries; it did not modify either database."
+          CONTAINER_SCRIPT
