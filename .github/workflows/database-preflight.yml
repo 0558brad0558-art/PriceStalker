@@ -65,3 +65,50 @@ jobs:
           echo
           echo "Inspection finished. This workflow only ran SELECT queries; it did not modify either database."
           CONTAINER_SCRIPT
+
+      - name: Test PostgreSQL 18 to 17 logical restore (temporary database only)
+        shell: bash
+        env:
+          SOURCE_DATABASE_URL: ${{ secrets.SOURCE_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          test_password="PriceStalkerCompatTest2026"
+          docker run -d --name pg17-compat-test \
+            -e POSTGRES_PASSWORD="$test_password" \
+            -e POSTGRES_DB=postgres \
+            postgres:17-alpine
+          cleanup() {
+            docker rm -f pg17-compat-test >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          ready=false
+          for attempt in $(seq 1 30); do
+            if docker exec pg17-compat-test pg_isready -U postgres >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          [[ "$ready" == true ]] || { echo "::error::Temporary PostgreSQL 17 test server did not become ready."; exit 1; }
+
+          docker run --rm --network container:pg17-compat-test \
+            -e SOURCE_DATABASE_URL \
+            -e TEST_DATABASE_URL="postgresql://postgres:$test_password@127.0.0.1:5432/postgres" \
+            postgres:18-alpine sh -s <<'CONTAINER_SCRIPT'
+          set -eu
+          echo "Creating a temporary logical dump from Render PostgreSQL 18..."
+          pg_dump "$SOURCE_DATABASE_URL" --format=custom --no-owner --no-acl --file=/tmp/pricestalker-compat.dump
+          echo "Restoring the dump into an isolated temporary PostgreSQL 17 database..."
+          pg_restore --exit-on-error --no-owner --no-acl --dbname="$TEST_DATABASE_URL" /tmp/pricestalker-compat.dump
+          echo "Temporary restore completed. Checking restored table inventory..."
+          psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -P pager=off -c "
+            SELECT count(*) AS restored_user_tables
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND table_type = 'BASE TABLE';"
+          psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -P pager=off -c "
+            SELECT pg_size_pretty(pg_database_size(current_database())) AS restored_database_size;"
+          echo "PostgreSQL 18-to-17 logical restore compatibility test PASSED."
+          echo "Only a temporary container was modified; Render and Prisma databases were not changed."
+          CONTAINER_SCRIPT
