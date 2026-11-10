@@ -1,28 +1,51 @@
-import pool from '../../../config/database';
-import { logger } from '../../../utils/system/logger';
-import { configCache, regionalMappingCache, settingsCache } from '../../../utils/cache';
 
-/**
- * Connects to PostgreSQL and listens for changes in system settings or retailer configs.
- */
+import { Client } from 'pg';
+import { logger } from '../../../utils/system/logger';
+import {
+  configCache,
+  regionalMappingCache,
+  settingsCache
+} from '../../../utils/cache';
+
 export function startSettingsListener() {
   if (process.env.NODE_ENV === 'test') return;
 
-  let client: any = null;
+  const connectionString = process.env.DATABASE_DIRECT_URL;
+
+  if (!connectionString) {
+    logger.error(
+      'Settings Listener | DATABASE_DIRECT_URL is missing',
+      'Database'
+    );
+    return;
+  }
+
+  let client: Client | null = null;
+  let reconnectTimeout: NodeJS.Timeout | null = null;
 
   async function connectAndListen() {
+    const listener = new Client({
+      connectionString
+    });
+
+    client = listener;
+
     try {
-      client = await pool.connect();
-      
-      logger.info('System | Settings Listener | Connected to database', 'Database');
-      await client.query('LISTEN settings_change');
+      await listener.connect();
+
+      logger.info(
+        'Settings Listener | Connected using direct database connection',
+        'Database'
+      );
+
+      await listener.query('LISTEN settings_change');
 
       let debounceTimeout: NodeJS.Timeout | null = null;
       const pendingPayloads = new Set<string>();
 
-      client.on('notification', (msg: any) => {
+      listener.on('notification', (msg) => {
         if (msg.channel === 'settings_change') {
-          pendingPayloads.add(msg.payload);
+          pendingPayloads.add(msg.payload || '');
 
           if (debounceTimeout) {
             clearTimeout(debounceTimeout);
@@ -30,44 +53,63 @@ export function startSettingsListener() {
 
           debounceTimeout = setTimeout(() => {
             const payloads = Array.from(pendingPayloads).join(', ');
-            logger.info(`System | Settings Listener | Notifications processed: [${payloads}]. Clearing cache.`, 'System');
+
+            logger.info(
+              `Settings Listener | Notifications processed: [${payloads}]. Clearing cache.`,
+              'System'
+            );
+
             configCache.invalidate();
             regionalMappingCache.clear();
             settingsCache.clear();
+
             pendingPayloads.clear();
             debounceTimeout = null;
           }, 250);
         }
       });
 
-      client.on('error', (err: any) => {
-        logger.error('System | Settings Listener | DB Client error', 'Database', err);
-        reconnect();
+      listener.on('error', (err) => {
+        logger.error(
+          'Settings Listener | Database client error',
+          'Database',
+          err
+        );
+        reconnect(listener);
       });
 
-      client.on('end', () => {
-        logger.warn('System | Settings Listener | DB Connection ended', 'Database');
-        reconnect();
+      listener.on('end', () => {
+        logger.warn(
+          'Settings Listener | Database connection ended',
+          'Database'
+        );
+        reconnect(listener);
       });
 
     } catch (error) {
-      logger.error('System | Settings Listener | Failed to connect and listen', 'Database', error);
-      reconnect();
+      logger.error(
+        'Settings Listener | Failed to connect and listen',
+        'Database',
+        error
+      );
+      reconnect(listener);
     }
   }
 
-  let reconnectTimeout: any = null;
-  function reconnect() {
-    if (client) {
-      try {
-        client.release(true); // force destroy this client
-      } catch (e) {}
-      client = null;
-    }
+  function reconnect(failedClient: Client) {
+    if (client !== failedClient) return;
+
+    client = null;
+
+    failedClient.end().catch(() => {});
 
     if (reconnectTimeout) return;
-    
-    logger.info('System | Settings Listener | Scheduling reconnection in 5s...', 'Database');
+
+    logger.info(
+      'Settings Listener | Scheduling reconnection in 5 seconds',
+      'Database'
+    );
+
     reconnectTimeout = setTimeout(() => {
       reconnectTimeout = null;
       connectAndListen();
