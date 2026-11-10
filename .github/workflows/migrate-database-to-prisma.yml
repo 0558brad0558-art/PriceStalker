@@ -1,0 +1,116 @@
+name: Migrate PriceStalker to Prisma Postgres
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_restore:
+        description: "Type RESTORE to copy the Render database into the empty Prisma database"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pricestalker-database-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Restore and verify database
+    if: ${{ inputs.confirm_restore == 'RESTORE' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check confirmation and secrets
+        shell: bash
+        env:
+          CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
+          SOURCE_DATABASE_URL: ${{ secrets.SOURCE_DATABASE_URL }}
+          TARGET_DATABASE_URL: ${{ secrets.TARGET_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRM_RESTORE" == "RESTORE" ]] || { echo "::error::Confirmation did not match."; exit 1; }
+          [[ -n "$SOURCE_DATABASE_URL" ]] || { echo "::error::SOURCE_DATABASE_URL is missing."; exit 1; }
+          [[ -n "$TARGET_DATABASE_URL" ]] || { echo "::error::TARGET_DATABASE_URL is missing."; exit 1; }
+          echo "Confirmation and both database secrets are present. Secret values are not displayed."
+
+      - name: Copy Render database into Prisma and compare every table
+        shell: bash
+        env:
+          SOURCE_DATABASE_URL: ${{ secrets.SOURCE_DATABASE_URL }}
+          TARGET_DATABASE_URL: ${{ secrets.TARGET_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e SOURCE_DATABASE_URL \
+            -e TARGET_DATABASE_URL \
+            postgres:18-alpine sh -s <<'CONTAINER_SCRIPT'
+          set -eu
+          dump_file=/tmp/pricestalker-migration.dump
+          cleanup() { rm -f "$dump_file"; }
+          trap cleanup EXIT
+
+          echo "Checking source and destination versions..."
+          source_version=$(psql "$SOURCE_DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -c "SHOW server_version_num")
+          target_version=$(psql "$TARGET_DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -c "SHOW server_version_num")
+          echo "Source PostgreSQL major version: $((source_version / 10000))"
+          echo "Target PostgreSQL major version: $((target_version / 10000))"
+          [ "$((source_version / 10000))" -eq 18 ] || { echo "Expected the known PostgreSQL 18 Render source; stopping."; exit 1; }
+          [ "$((target_version / 10000))" -eq 17 ] || { echo "Expected the PostgreSQL 17 Prisma destination; stopping."; exit 1; }
+
+          source_tables=$(psql "$SOURCE_DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') AND schemaname NOT LIKE 'pg_%'")
+          target_tables=$(psql "$TARGET_DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') AND schemaname NOT LIKE 'pg_%'")
+          echo "Source application tables: $source_tables"
+          echo "Destination application tables before restore: $target_tables"
+          [ "$source_tables" -gt 0 ] || { echo "Source has no application tables; stopping."; exit 1; }
+          [ "$target_tables" -eq 0 ] || { echo "::error::Prisma destination is not empty. Nothing was restored."; exit 1; }
+
+          echo "Creating a temporary compressed dump from Render..."
+          pg_dump "$SOURCE_DATABASE_URL" --format=custom --no-owner --no-acl --file="$dump_file"
+
+          echo "Restoring into Prisma using its direct connection..."
+          pg_restore --single-transaction --exit-on-error --no-owner --no-acl --dbname="$TARGET_DATABASE_URL" "$dump_file"
+
+          echo "Refreshing destination query statistics..."
+          psql "$TARGET_DATABASE_URL" -X -v ON_ERROR_STOP=1 -c "ANALYZE;"
+
+          table_counts() {
+            db_url="$1"
+            table_names=$(psql "$db_url" -X -At -v ON_ERROR_STOP=1 -c "SELECT quote_ident(schemaname)||'.'||quote_ident(tablename) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') AND schemaname NOT LIKE 'pg_%' ORDER BY schemaname, tablename")
+            while IFS= read -r table_name; do
+              [ -n "$table_name" ] || continue
+              row_count=$(psql "$db_url" -X -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM $table_name")
+              printf '%s=%s\n' "$table_name" "$row_count"
+            done <<EOF
+          $table_names
+          EOF
+          }
+
+          echo "Comparing exact table names and row counts..."
+          table_counts "$SOURCE_DATABASE_URL" | sort > /tmp/source-counts.txt
+          table_counts "$TARGET_DATABASE_URL" | sort > /tmp/target-counts.txt
+          if ! diff -u /tmp/source-counts.txt /tmp/target-counts.txt; then
+            echo "::error::Table names or row counts differ. Keep the Render database unchanged and do not switch the application."
+            exit 1
+          fi
+
+          echo "Comparing PriceStalker migration history..."
+          source_migrations=$(psql "$SOURCE_DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -c "SELECT name FROM public.migrations ORDER BY name")
+          target_migrations=$(psql "$TARGET_DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -c "SELECT name FROM public.migrations ORDER BY name")
+          [ "$source_migrations" = "$target_migrations" ] || { echo "::error::Migration history differs."; exit 1; }
+
+          echo "Verified application table count: $(wc -l < /tmp/source-counts.txt | tr -d ' ')"
+          echo "Verified applied migration count: $(printf '%s\n' "$source_migrations" | grep -c . || true)"
+          echo "SUCCESS: Prisma contains the same application tables and exact row counts as Render."
+          echo "The Render source was not modified. The dump was temporary and has been deleted."
+          echo "Do not change the Render backend DATABASE_URL until the next application-connection test."
+          rm -f /tmp/source-counts.txt /tmp/target-counts.txt
+          CONTAINER_SCRIPT
+
+      - name: Explain next step
+        if: success()
+        run: |
+          echo "Database copy and row-count verification succeeded."
+          echo "The original Render database remains available as a fallback."
+          echo "The backend connection string has NOT been changed by this workflow."
